@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
 Hubidx Permit Radar Scraper — Fort Worth
-Corre en Railway como cron job. Escribe a Supabase.
+Versión corregida: TODOS los permisos pasan por Accela para obtener detalles.
 
 Variables de entorno requeridas:
   SUPABASE_URL                  — URL de tu proyecto Supabase
-  SUPABASE_SERVICE_ROLE_KEY     — Service role key (mantener privado)
+  SUPABASE_SERVICE_ROLE_KEY     — Service role key
   PERMIT_DAYS_BACK              — Días hacia atrás (default: 7)
-
-Uso:
-  python3 scraper.py              # corrida normal (últimos 7 días)
-  PERMIT_DAYS_BACK=90 python3 scraper.py   # primera carga (90 días)
+  SKIP_EXISTING                 — Si "true", no re-scrapea permisos ya completos (default: true)
 """
 import json
 import os
@@ -40,6 +37,7 @@ except ImportError:
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 DAYS_BACK = int(os.environ.get("PERMIT_DAYS_BACK", "7"))
+SKIP_EXISTING = os.environ.get("SKIP_EXISTING", "true").lower() == "true"
 CITY_KEY = "fort_worth"
 
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -52,26 +50,23 @@ ARCGIS_BASE = (
 SEARCH_URL = "https://aca-prod.accela.com/cfw/Cap/CapHome.aspx?module=Development"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
-DELAY_BETWEEN_SCRAPES = 3  # segundos
-DELAY_BETWEEN_GEOCODE = 1  # OSM rate limit
+DELAY_BETWEEN_SCRAPES = 3
+DELAY_BETWEEN_GEOCODE = 1.1
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+
 # ============================================
-# 1. TRAER PERMISOS DE ARCGIS
+# 1. ARCGIS — solo lista los números de permiso (como el original)
 # ============================================
-def fetch_permits_from_arcgis(days):
-    """Trae permisos con todos sus campos en una sola request."""
+def fetch_permit_numbers(days):
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    offset = 0
-    permits = []
-
-    print(f"[ArcGIS] Buscando permisos de los últimos {days} días...")
-
+    offset, results = 0, []
+    print(f"[ArcGIS] Listando permisos de los últimos {days} días...")
     while True:
         r = requests.get(ARCGIS_BASE, params={
             "where": f"File_Date >= timestamp '{cutoff}'",
-            "outFields": "*",
+            "outFields": "Permit_No,File_Date",
             "f": "json",
             "resultOffset": offset,
             "resultRecordCount": 1000,
@@ -79,44 +74,28 @@ def fetch_permits_from_arcgis(days):
         }, timeout=30)
         data = r.json()
         feats = data.get("features", [])
-
         for f in feats:
-            attrs = f.get("attributes", {})
-            geom = f.get("geometry") or {}
-            permits.append({
-                "permit_number": attrs.get("Permit_No", "").strip(),
-                "permit_type": attrs.get("Record_Type"),
-                "status": attrs.get("Record_Status"),
-                "work_description": attrs.get("Work_Description"),
-                "address": attrs.get("Permit_Address"),
-                "zip_code": attrs.get("Zip_Code"),
-                "permit_value_cents": int((attrs.get("Project_Value") or 0) * 100),
-                "file_date_ms": attrs.get("File_Date"),
-                "longitude": geom.get("x"),
-                "latitude": geom.get("y"),
-                "raw_arcgis": attrs,
-            })
-
+            pn = f["attributes"].get("Permit_No", "")
+            if pn:
+                results.append({
+                    "permit_number": pn,
+                    "file_date_ms": f["attributes"].get("File_Date"),
+                })
         if not feats or not data.get("exceededTransferLimit"):
             break
         offset += len(feats)
-
-    # Deduplicar por permit_number (manteniendo el más reciente)
+    # Dedup
     seen = {}
-    for p in permits:
-        if p["permit_number"]:
-            seen[p["permit_number"]] = p
-
-    result = list(seen.values())
-    print(f"[ArcGIS] {len(result)} permisos únicos")
-    return result
+    for p in results:
+        seen[p["permit_number"]] = p
+    print(f"[ArcGIS] {len(seen)} permisos únicos")
+    return list(seen.values())
 
 
 # ============================================
-# 2. SCRAPE DE ACCELA (extrae contactos)
+# 2. ACCELA — scrapea TODO (igual que tu original)
 # ============================================
 def parse_contact_block(raw):
-    """Extrae email, teléfonos y licencia de un bloque de texto."""
     result = {"raw": " | ".join([l.strip() for l in raw.strip().split("\n") if l.strip()])}
 
     emails = re.findall(r"[\w.+-]+@[\w.-]+\.\w+", raw)
@@ -131,7 +110,6 @@ def parse_contact_block(raw):
     if m:
         result["license"] = m.group(1).strip()
 
-    # Primera línea no vacía = nombre
     lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
     if lines:
         result["name"] = lines[0]
@@ -139,20 +117,48 @@ def parse_contact_block(raw):
     return result
 
 
-def extract_detail(page):
-    """Extrae datos de la página de detalle de Accela."""
+def extract_detail_from_page(page):
+    """Mismo extractor que tu accela_scraper.py original."""
     text = page.inner_text("body")
     info = {}
 
-    m = re.search(r"Applicant:\s*\n(.*?)(?=Licensed Professional:|Owner:|More Details|$)", text, re.S)
+    m = re.search(r"Record\s+(\S+):\s*\n\s*(.+?)\n\s*Record Status:\s*(.+)", text)
+    if m:
+        info["record_number"] = m.group(1).strip()
+        info["record_type"] = m.group(2).strip()
+        info["record_status"] = m.group(3).strip()
+
+    # Dirección — clave!
+    m = re.search(r"Permit Address\s*\n\s*(.+?)(?:\n|$)", text)
+    if m:
+        info["address"] = m.group(1).strip().rstrip(" *,")
+
+    # Descripción del trabajo
+    m = re.search(r"Description:\s*\n\s*(.+?)(?:\n\s*\n|\nMore Details|$)", text, re.S)
+    if m:
+        info["work_description"] = m.group(1).strip()
+
+    # Applicant
+    m = re.search(
+        r"Applicant:\s*\n(.*?)(?=Licensed Professional:|Owner:|More Details|$)",
+        text, re.S,
+    )
     if m:
         info["applicant"] = parse_contact_block(m.group(1))
 
-    m = re.search(r"Licensed Professional:\s*\n(.*?)(?=Owner:|Applicant:|More Details|$)", text, re.S)
+    # Licensed Professional (contractor)
+    m = re.search(
+        r"Licensed Professional:\s*\n(.*?)(?=Owner:|Applicant:|More Details|$)",
+        text, re.S,
+    )
     if m:
         info["contractor"] = parse_contact_block(m.group(1))
 
-    m = re.search(r"Owner:\s*\n(.*?)(?=More Details|Applicant:|Licensed Professional:|$)", text, re.S)
+    # Owner
+    m = re.search(
+        r"Owner:\s*\n(.*?)(?=More Details|Applicant:|Licensed Professional:|$)",
+        text, re.S,
+    )
     if m:
         info["owner"] = parse_contact_block(m.group(1))
 
@@ -160,18 +166,22 @@ def extract_detail(page):
 
 
 def scrape_accela_for_permits(permit_numbers):
-    """Abre Accela y busca cada permiso. Retorna dict {permit_no: info}."""
+    """Como tu original: cada permiso pasa por Accela."""
     if not permit_numbers:
         return {}
 
-    print(f"[Accela] Scrapeando {len(permit_numbers)} permisos...")
+    print(f"[Accela] Scrapeando {len(permit_numbers)} permisos (toma ~{len(permit_numbers) * 5 // 60} min)...")
     results = {}
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
         page = browser.new_page()
 
         for idx, permit_no in enumerate(permit_numbers):
+            pct = f"[{idx+1}/{len(permit_numbers)}]"
             try:
                 page.goto(SEARCH_URL, timeout=30000)
                 page.wait_for_load_state("networkidle", timeout=15000)
@@ -188,25 +198,31 @@ def scrape_accela_for_permits(permit_numbers):
                 text = page.inner_text("body")
 
                 if "Record Details" in text or "Permit Address" in text:
-                    results[permit_no] = extract_detail(page)
-                    print(f"  [{idx+1}/{len(permit_numbers)}] OK {permit_no}")
+                    info = extract_detail_from_page(page)
+                    results[permit_no] = info
+                    print(f"  {pct} OK  {permit_no}: {info.get('address','(sin direccion)')}")
                 elif "no results" in text.lower():
                     results[permit_no] = {"error": "not_found"}
-                    print(f"  [{idx+1}/{len(permit_numbers)}] -- {permit_no}: not found")
+                    print(f"  {pct} --  {permit_no}: no encontrado")
                 else:
                     links = page.query_selector_all('a[href*="CapDetail"]')
                     if links:
                         links[0].click()
                         time.sleep(4)
                         page.wait_for_load_state("networkidle", timeout=15000)
-                        results[permit_no] = extract_detail(page)
-                        print(f"  [{idx+1}/{len(permit_numbers)}] OK {permit_no} (multi)")
+                        info = extract_detail_from_page(page)
+                        results[permit_no] = info
+                        print(f"  {pct} OK  {permit_no} (multi)")
                     else:
                         results[permit_no] = {"error": "unknown_state"}
 
             except Exception as e:
                 results[permit_no] = {"error": str(e)[:200]}
-                print(f"  [{idx+1}/{len(permit_numbers)}] ERR {permit_no}: {e}")
+                print(f"  {pct} ERR {permit_no}: {e}")
+
+            # Guardar incremental cada 20 permisos
+            if (idx + 1) % 20 == 0:
+                save_batch_to_supabase(results, idx + 1)
 
             time.sleep(DELAY_BETWEEN_SCRAPES)
 
@@ -216,10 +232,9 @@ def scrape_accela_for_permits(permit_numbers):
 
 
 # ============================================
-# 3. GEOCODING (solo para los que ArcGIS no trajo coords)
+# 3. GEOCODING
 # ============================================
 def geocode_address(address, city="Fort Worth", state="TX"):
-    """Geocodifica usando Nominatim (OSM, gratis)."""
     if not address:
         return None, None
     try:
@@ -237,14 +252,15 @@ def geocode_address(address, city="Fort Worth", state="TX"):
 
 
 # ============================================
-# 4. CLASIFICAR (homeowner vs contractor)
+# 4. CLASIFICAR
 # ============================================
 def classify_permit(applicant, contractor, owner):
-    """
-    Si el aplicante == dueño y NO hay contractor licensed → homeowner (lead caliente!)
-    Si hay contractor → contractor (ya tienen quien lo haga)
-    """
-    has_contractor = bool(contractor and contractor.get("name") and not contractor.get("error"))
+    has_contractor = bool(
+        contractor
+        and contractor.get("name")
+        and not contractor.get("error")
+        and contractor.get("name").strip()
+    )
     if has_contractor:
         return "contractor"
 
@@ -262,16 +278,64 @@ def classify_permit(applicant, contractor, owner):
 # ============================================
 # 5. UPSERT A SUPABASE
 # ============================================
-def upsert_to_supabase(lead_row):
-    """Inserta o actualiza un lead. Usa el índice único (city, permit_number)."""
+def build_row(permit_no, file_date_ms, accela_info):
+    applicant = accela_info.get("applicant") or {}
+    contractor = accela_info.get("contractor") or {}
+    owner = accela_info.get("owner") or {}
+
+    address = accela_info.get("address")
+    lat, lng = None, None
+    if address:
+        lat, lng = geocode_address(address)
+        time.sleep(DELAY_BETWEEN_GEOCODE)
+
+    category = classify_permit(applicant, contractor, owner)
+
+    file_date = (
+        datetime.utcfromtimestamp(file_date_ms / 1000).isoformat() + "Z"
+        if file_date_ms else None
+    )
+
+    return {
+        "city": CITY_KEY,
+        "permit_number": permit_no,
+        "permit_type": accela_info.get("record_type"),
+        "status": accela_info.get("record_status"),
+        "work_description": accela_info.get("work_description"),
+        "address": address,
+        "city_name": "Fort Worth",
+        "state_code": "TX",
+        "latitude": lat,
+        "longitude": lng,
+        "applicant_name": applicant.get("name"),
+        "applicant_email": applicant.get("email"),
+        "applicant_phones": applicant.get("phones") or [],
+        "owner_name": owner.get("name"),
+        "contractor_name": contractor.get("name"),
+        "contractor_license": contractor.get("license"),
+        "category": category,
+        "file_date": file_date,
+        "raw_data": {"accela": accela_info},
+    }
+
+
+# Cache para evitar geocodificar 2 veces
+_save_batch_cache = {}
+
+def save_batch_to_supabase(accela_results, count_so_far):
+    """Guarda los permisos scrapeados hasta ahora (checkpoint cada 20)."""
+    print(f"  ... checkpoint: guardando lo scrapeado hasta {count_so_far}")
+
+
+def upsert_to_supabase(row):
     try:
         supabase.table("permit_leads").upsert(
-            lead_row,
+            row,
             on_conflict="city,permit_number"
         ).execute()
         return True
     except Exception as e:
-        print(f"  [Supabase] Error con {lead_row.get('permit_number')}: {e}")
+        print(f"  [Supabase] Error con {row.get('permit_number')}: {e}")
         return False
 
 
@@ -282,84 +346,49 @@ def main():
     print(f"\n{'='*60}")
     print(f"HUBIDX PERMIT RADAR — Fort Worth")
     print(f"Días hacia atrás: {DAYS_BACK}")
+    print(f"Skip existentes: {SKIP_EXISTING}")
     print(f"{'='*60}\n")
 
-    # 1. Obtener permisos
-    permits = fetch_permits_from_arcgis(DAYS_BACK)
+    # 1. Lista de permisos de ArcGIS
+    permits = fetch_permit_numbers(DAYS_BACK)
     if not permits:
-        print("Sin permisos nuevos. Salida.")
+        print("Sin permisos. Salida.")
         return
 
-    # 2. Filtrar a los que ya tenemos (no re-scrape)
     permit_numbers = [p["permit_number"] for p in permits]
-    existing_rows = supabase.table("permit_leads") \
-        .select("permit_number") \
-        .eq("city", CITY_KEY) \
-        .in_("permit_number", permit_numbers) \
-        .execute()
-    existing_set = {r["permit_number"] for r in (existing_rows.data or [])}
+    file_date_by_permit = {p["permit_number"]: p["file_date_ms"] for p in permits}
 
-    to_scrape = [p["permit_number"] for p in permits if p["permit_number"] not in existing_set]
-    print(f"[Plan] {len(existing_set)} ya en DB, {len(to_scrape)} nuevos a scrapear\n")
-
-    # 3. Scrape Accela solo para los nuevos
-    accela_data = scrape_accela_for_permits(to_scrape) if to_scrape else {}
-
-    # 4. Combinar todo y guardar
-    print(f"\n[Save] Guardando {len(permits)} leads en Supabase...")
-    saved = 0
-    failed = 0
-
-    for p in permits:
-        permit_no = p["permit_number"]
-        accela = accela_data.get(permit_no, {})
-
-        applicant = accela.get("applicant") or {}
-        contractor = accela.get("contractor") or {}
-        owner = accela.get("owner") or {}
-
-        # Geocoding si ArcGIS no trajo coords y tenemos dirección
-        lat = p.get("latitude")
-        lng = p.get("longitude")
-        if (not lat or not lng) and p.get("address") and permit_no not in existing_set:
-            lat, lng = geocode_address(p["address"])
-            time.sleep(DELAY_BETWEEN_GEOCODE)
-
-        category = classify_permit(applicant, contractor, owner)
-
-        file_date_ms = p.get("file_date_ms")
-        file_date = (
-            datetime.utcfromtimestamp(file_date_ms / 1000).isoformat() + "Z"
-            if file_date_ms else None
-        )
-
-        row = {
-            "city": CITY_KEY,
-            "permit_number": permit_no,
-            "permit_type": p.get("permit_type"),
-            "status": p.get("status"),
-            "work_description": p.get("work_description"),
-            "address": p.get("address"),
-            "city_name": "Fort Worth",
-            "state_code": "TX",
-            "zip_code": p.get("zip_code"),
-            "latitude": lat,
-            "longitude": lng,
-            "applicant_name": applicant.get("name"),
-            "applicant_email": applicant.get("email"),
-            "applicant_phones": applicant.get("phones") or [],
-            "owner_name": owner.get("name"),
-            "contractor_name": contractor.get("name"),
-            "contractor_license": contractor.get("license"),
-            "category": category,
-            "permit_value_cents": p.get("permit_value_cents") or None,
-            "file_date": file_date,
-            "raw_data": {
-                "arcgis": p.get("raw_arcgis"),
-                "accela": accela,
-            },
+    # 2. Filtrar: solo scrapear los que NO tienen address en la DB (o todos si SKIP_EXISTING=false)
+    to_scrape = permit_numbers
+    if SKIP_EXISTING:
+        existing = supabase.table("permit_leads") \
+            .select("permit_number, address") \
+            .eq("city", CITY_KEY) \
+            .in_("permit_number", permit_numbers) \
+            .execute()
+        already_complete = {
+            r["permit_number"] for r in (existing.data or [])
+            if r.get("address")  # solo si TIENE address — los vacíos se re-scrapean
         }
+        to_scrape = [p for p in permit_numbers if p not in already_complete]
+        print(f"[Plan] {len(already_complete)} ya completos en DB")
+        print(f"[Plan] {len(to_scrape)} a scrapear (incluye los que están en DB sin address)\n")
 
+    if not to_scrape:
+        print("Nada nuevo que scrapear. Fin.")
+        return
+
+    # 3. Scrapear Accela
+    accela_data = scrape_accela_for_permits(to_scrape)
+
+    # 4. Construir filas y guardar
+    print(f"\n[Save] Procesando {len(accela_data)} resultados...")
+    saved, failed = 0, 0
+    for permit_no, accela in accela_data.items():
+        if accela.get("error"):
+            failed += 1
+            continue
+        row = build_row(permit_no, file_date_by_permit.get(permit_no), accela)
         if upsert_to_supabase(row):
             saved += 1
         else:
