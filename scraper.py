@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-Hubidx Permit Radar Scraper — Fort Worth
-TODOS los permisos pasan por Accela para obtener detalles completos.
-
-Variables de entorno requeridas:
-  SUPABASE_URL                  — URL de tu proyecto Supabase
-  SUPABASE_SERVICE_ROLE_KEY     — Service role key
-  PERMIT_DAYS_BACK              — Días hacia atrás (default: 7)
-  SKIP_EXISTING                 — Si "true", no re-scrapea permisos ya completos (default: true)
+Hubidx Permit Radar Scraper — Fort Worth (v3)
+- Filtros inteligentes: solo permits "vendibles"
+- Guardado incremental fila por fila (a prueba de cortes)
+- Logs en tiempo real
 """
-import json
 import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     from playwright.sync_api import sync_playwright
@@ -38,7 +33,27 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 DAYS_BACK = int(os.environ.get("PERMIT_DAYS_BACK", "7"))
 SKIP_EXISTING = os.environ.get("SKIP_EXISTING", "true").lower() == "true"
+ISSUED_MAX_AGE_DAYS = int(os.environ.get("ISSUED_MAX_AGE_DAYS", "7"))
 CITY_KEY = "fort_worth"
+
+# Estatus que EXCLUIMOS siempre (ya no hay nada que vender)
+EXCLUDE_STATUSES = {
+    "finaled", "final", "completed", "closed", "void", "voided",
+    "expired-final", "permit final", "co issued",  # variantes comunes
+}
+
+# Estatus que SIEMPRE incluimos sin importar la fecha
+ALWAYS_INCLUDE_STATUSES = {
+    "in review", "plan review", "pending", "pending review",
+    "submitted", "intake", "routing", "under review",
+    "cancelled", "canceled", "withdrawn", "expired", "rejected",
+    "denied", "on hold", "hold",
+}
+
+# Estatus que SOLO incluimos si File_Date < ISSUED_MAX_AGE_DAYS
+RECENT_ONLY_STATUSES = {
+    "issued", "active", "approved", "ready to issue",
+}
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     sys.exit("ERROR: SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY son requeridas")
@@ -57,16 +72,17 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ============================================
-# 1. ARCGIS
+# 1. ARCGIS — con info de estatus para filtrar
 # ============================================
-def fetch_permit_numbers(days):
+def fetch_permits_with_metadata(days):
+    """Pide a ArcGIS los permisos con su estatus y file_date."""
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     offset, results = 0, []
-    print(f"[ArcGIS] Listando permisos de los últimos {days} días...")
+    print(f"[ArcGIS] Listando permisos de los últimos {days} días...", flush=True)
     while True:
         r = requests.get(ARCGIS_BASE, params={
             "where": f"File_Date >= timestamp '{cutoff}'",
-            "outFields": "Permit_No,File_Date",
+            "outFields": "Permit_No,File_Date,Record_Status,Record_Type",
             "f": "json",
             "resultOffset": offset,
             "resultRecordCount": 1000,
@@ -75,20 +91,78 @@ def fetch_permit_numbers(days):
         data = r.json()
         feats = data.get("features", [])
         for f in feats:
-            pn = f["attributes"].get("Permit_No", "")
+            attrs = f.get("attributes", {})
+            pn = attrs.get("Permit_No", "")
             if pn:
                 results.append({
                     "permit_number": pn,
-                    "file_date_ms": f["attributes"].get("File_Date"),
+                    "file_date_ms": attrs.get("File_Date"),
+                    "record_status": (attrs.get("Record_Status") or "").strip(),
+                    "record_type": (attrs.get("Record_Type") or "").strip(),
                 })
         if not feats or not data.get("exceededTransferLimit"):
             break
         offset += len(feats)
+    # Dedup por permit_number
     seen = {}
     for p in results:
         seen[p["permit_number"]] = p
-    print(f"[ArcGIS] {len(seen)} permisos únicos")
+    print(f"[ArcGIS] {len(seen)} permisos únicos", flush=True)
     return list(seen.values())
+
+
+def filter_sellable_permits(permits):
+    """Aplica los filtros para quedarnos solo con permits 'vendibles'."""
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    max_age_ms = ISSUED_MAX_AGE_DAYS * 24 * 60 * 60 * 1000
+
+    # Resumen por estatus (para debugging)
+    status_counts = {}
+    for p in permits:
+        s = p["record_status"].lower() or "(empty)"
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    print(f"\n[Filter] Resumen por estatus en ArcGIS:", flush=True)
+    for s, c in sorted(status_counts.items(), key=lambda x: -x[1]):
+        print(f"  {c:6d}  {s}", flush=True)
+
+    kept = []
+    excluded_counts = {"obvious": 0, "issued_old": 0, "empty": 0, "unknown": 0}
+
+    for p in permits:
+        s = p["record_status"].lower().strip()
+
+        if not s:
+            excluded_counts["empty"] += 1
+            continue
+
+        if s in EXCLUDE_STATUSES:
+            excluded_counts["obvious"] += 1
+            continue
+
+        if s in ALWAYS_INCLUDE_STATUSES:
+            kept.append(p)
+            continue
+
+        if s in RECENT_ONLY_STATUSES:
+            file_date_ms = p.get("file_date_ms")
+            if file_date_ms and (now_ms - file_date_ms) <= max_age_ms:
+                kept.append(p)
+            else:
+                excluded_counts["issued_old"] += 1
+            continue
+
+        # Estatus desconocido — por default lo incluimos para no perder oportunidades
+        excluded_counts["unknown"] += 1
+        kept.append(p)
+
+    print(f"\n[Filter] Resultados:", flush=True)
+    print(f"  Excluidos (finaled/closed/etc): {excluded_counts['obvious']}", flush=True)
+    print(f"  Excluidos (Issued >7 días): {excluded_counts['issued_old']}", flush=True)
+    print(f"  Excluidos (estatus vacío): {excluded_counts['empty']}", flush=True)
+    print(f"  Estatus desconocido (incluidos): {excluded_counts['unknown']}", flush=True)
+    print(f"  → TOTAL A SCRAPEAR: {len(kept)}\n", flush=True)
+    return kept
 
 
 # ============================================
@@ -158,68 +232,6 @@ def extract_detail_from_page(page):
     return info
 
 
-def scrape_accela_for_permits(permit_numbers):
-    if not permit_numbers:
-        return {}
-
-    estimated_min = len(permit_numbers) * 5 // 60
-    print(f"[Accela] Scrapeando {len(permit_numbers)} permisos (toma ~{estimated_min} min)...")
-    results = {}
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        page = browser.new_page()
-
-        for idx, permit_no in enumerate(permit_numbers):
-            pct = f"[{idx+1}/{len(permit_numbers)}]"
-            try:
-                page.goto(SEARCH_URL, timeout=30000)
-                page.wait_for_load_state("networkidle", timeout=15000)
-                time.sleep(1.5)
-
-                page.fill(
-                    "#ctl00_PlaceHolderMain_generalSearchForm_txtGSPermitNumber",
-                    permit_no,
-                )
-                page.click("#ctl00_PlaceHolderMain_btnNewSearch")
-                time.sleep(4)
-                page.wait_for_load_state("networkidle", timeout=15000)
-
-                text = page.inner_text("body")
-
-                if "Record Details" in text or "Permit Address" in text:
-                    info = extract_detail_from_page(page)
-                    results[permit_no] = info
-                    print(f"  {pct} OK  {permit_no}: {info.get('address','(sin direccion)')}")
-                elif "no results" in text.lower():
-                    results[permit_no] = {"error": "not_found"}
-                    print(f"  {pct} --  {permit_no}: no encontrado")
-                else:
-                    links = page.query_selector_all('a[href*="CapDetail"]')
-                    if links:
-                        links[0].click()
-                        time.sleep(4)
-                        page.wait_for_load_state("networkidle", timeout=15000)
-                        info = extract_detail_from_page(page)
-                        results[permit_no] = info
-                        print(f"  {pct} OK  {permit_no} (multi)")
-                    else:
-                        results[permit_no] = {"error": "unknown_state"}
-
-            except Exception as e:
-                results[permit_no] = {"error": str(e)[:200]}
-                print(f"  {pct} ERR {permit_no}: {e}")
-
-            time.sleep(DELAY_BETWEEN_SCRAPES)
-
-        browser.close()
-
-    return results
-
-
 # ============================================
 # 3. GEOCODING
 # ============================================
@@ -236,7 +248,7 @@ def geocode_address(address, city="Fort Worth", state="TX"):
         if results:
             return float(results[0]["lat"]), float(results[0]["lon"])
     except Exception as e:
-        print(f"  [Geocode] Error: {e}")
+        print(f"  [Geocode] Error: {e}", flush=True)
     return None, None
 
 
@@ -267,7 +279,7 @@ def classify_permit(applicant, contractor, owner):
 # ============================================
 # 5. UPSERT A SUPABASE
 # ============================================
-def build_row(permit_no, file_date_ms, accela_info):
+def build_row(permit_no, metadata, accela_info):
     applicant = accela_info.get("applicant") or {}
     contractor = accela_info.get("contractor") or {}
     owner = accela_info.get("owner") or {}
@@ -280,16 +292,21 @@ def build_row(permit_no, file_date_ms, accela_info):
 
     category = classify_permit(applicant, contractor, owner)
 
+    file_date_ms = metadata.get("file_date_ms")
     file_date = (
         datetime.utcfromtimestamp(file_date_ms / 1000).isoformat() + "Z"
         if file_date_ms else None
     )
 
+    # Tipo y estatus: prefiero los de Accela si están, si no los de ArcGIS
+    permit_type = accela_info.get("record_type") or metadata.get("record_type")
+    status = accela_info.get("record_status") or metadata.get("record_status")
+
     return {
         "city": CITY_KEY,
         "permit_number": permit_no,
-        "permit_type": accela_info.get("record_type"),
-        "status": accela_info.get("record_status"),
+        "permit_type": permit_type,
+        "status": status,
         "work_description": accela_info.get("work_description"),
         "address": address,
         "city_name": "Fort Worth",
@@ -304,7 +321,7 @@ def build_row(permit_no, file_date_ms, accela_info):
         "contractor_license": contractor.get("license"),
         "category": category,
         "file_date": file_date,
-        "raw_data": {"accela": accela_info},
+        "raw_data": {"accela": accela_info, "arcgis": metadata},
     }
 
 
@@ -316,33 +333,125 @@ def upsert_to_supabase(row):
         ).execute()
         return True
     except Exception as e:
-        print(f"  [Supabase] Error con {row.get('permit_number')}: {e}")
+        print(f"  [Supabase] Error con {row.get('permit_number')}: {e}", flush=True)
         return False
+
+
+# ============================================
+# 6. SCRAPING LOOP — CON GUARDADO INCREMENTAL
+# ============================================
+def scrape_and_save(permits_metadata):
+    """Scrapea cada permiso Y LO GUARDA INMEDIATAMENTE."""
+    if not permits_metadata:
+        return 0, 0
+
+    total = len(permits_metadata)
+    estimated_min = total * 5 // 60
+    print(f"[Accela] Scrapeando {total} permisos (toma ~{estimated_min} min)...", flush=True)
+    print(f"[Accela] Cada permiso se GUARDA en DB inmediatamente (a prueba de cortes)\n", flush=True)
+
+    saved = 0
+    failed = 0
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        page = browser.new_page()
+
+        for idx, meta in enumerate(permits_metadata):
+            permit_no = meta["permit_number"]
+            pct = f"[{idx+1}/{total}]"
+
+            try:
+                page.goto(SEARCH_URL, timeout=30000)
+                page.wait_for_load_state("networkidle", timeout=15000)
+                time.sleep(1.5)
+
+                page.fill(
+                    "#ctl00_PlaceHolderMain_generalSearchForm_txtGSPermitNumber",
+                    permit_no,
+                )
+                page.click("#ctl00_PlaceHolderMain_btnNewSearch")
+                time.sleep(4)
+                page.wait_for_load_state("networkidle", timeout=15000)
+
+                text = page.inner_text("body")
+                accela_info = None
+
+                if "Record Details" in text or "Permit Address" in text:
+                    accela_info = extract_detail_from_page(page)
+                elif "no results" in text.lower():
+                    print(f"  {pct} -- {permit_no}: no encontrado en Accela", flush=True)
+                    failed += 1
+                    time.sleep(DELAY_BETWEEN_SCRAPES)
+                    continue
+                else:
+                    links = page.query_selector_all('a[href*="CapDetail"]')
+                    if links:
+                        links[0].click()
+                        time.sleep(4)
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                        accela_info = extract_detail_from_page(page)
+                    else:
+                        print(f"  {pct} ?? {permit_no}: estado desconocido", flush=True)
+                        failed += 1
+                        time.sleep(DELAY_BETWEEN_SCRAPES)
+                        continue
+
+                # GUARDAR INMEDIATAMENTE
+                if accela_info:
+                    row = build_row(permit_no, meta, accela_info)
+                    if upsert_to_supabase(row):
+                        saved += 1
+                        addr = row.get("address") or "(sin dir)"
+                        cat = row.get("category")
+                        print(f"  {pct} OK [{cat}] {permit_no}: {addr[:50]}", flush=True)
+                    else:
+                        failed += 1
+
+            except Exception as e:
+                print(f"  {pct} ERR {permit_no}: {str(e)[:100]}", flush=True)
+                failed += 1
+
+            time.sleep(DELAY_BETWEEN_SCRAPES)
+
+        browser.close()
+
+    return saved, failed
 
 
 # ============================================
 # MAIN
 # ============================================
 def main():
-    print(f"\n{'='*60}")
-    print(f"HUBIDX PERMIT RADAR — Fort Worth")
-    print(f"Días hacia atrás: {DAYS_BACK}")
-    print(f"Skip existentes: {SKIP_EXISTING}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*60}", flush=True)
+    print(f"HUBIDX PERMIT RADAR — Fort Worth", flush=True)
+    print(f"Días hacia atrás: {DAYS_BACK}", flush=True)
+    print(f"Skip existentes: {SKIP_EXISTING}", flush=True)
+    print(f"Issued max age: {ISSUED_MAX_AGE_DAYS} días", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
-    permits = fetch_permit_numbers(DAYS_BACK)
+    # 1. ArcGIS con metadata
+    permits = fetch_permits_with_metadata(DAYS_BACK)
     if not permits:
-        print("Sin permisos. Salida.")
+        print("Sin permisos. Salida.", flush=True)
         return
 
-    permit_numbers = [p["permit_number"] for p in permits]
-    file_date_by_permit = {p["permit_number"]: p["file_date_ms"] for p in permits}
+    # 2. Filtrar por estatus
+    sellable = filter_sellable_permits(permits)
+    if not sellable:
+        print("Ningún permiso pasa el filtro. Salida.", flush=True)
+        return
 
-    to_scrape = permit_numbers
+    # 3. Quitar los que ya están completos en DB
+    permit_numbers = [p["permit_number"] for p in sellable]
+
     if SKIP_EXISTING:
         already_complete = set()
         CHUNK_SIZE = 100
-        print(f"[Plan] Verificando {len(permit_numbers)} permisos en DB (en chunks de {CHUNK_SIZE})...")
+        print(f"[DB] Verificando {len(permit_numbers)} permisos en chunks de {CHUNK_SIZE}...", flush=True)
         for i in range(0, len(permit_numbers), CHUNK_SIZE):
             chunk = permit_numbers[i:i + CHUNK_SIZE]
             try:
@@ -355,33 +464,22 @@ def main():
                     if r.get("address"):
                         already_complete.add(r["permit_number"])
             except Exception as e:
-                print(f"  [DB] Error en chunk {i}-{i+CHUNK_SIZE}: {e}")
+                print(f"  [DB] Error en chunk: {e}", flush=True)
 
-        to_scrape = [p for p in permit_numbers if p not in already_complete]
-        print(f"[Plan] {len(already_complete)} ya completos en DB")
-        print(f"[Plan] {len(to_scrape)} a scrapear\n")
+        before = len(sellable)
+        sellable = [p for p in sellable if p["permit_number"] not in already_complete]
+        print(f"[DB] {len(already_complete)} ya completos en DB → quedan {len(sellable)} a scrapear\n", flush=True)
 
-    if not to_scrape:
-        print("Nada nuevo que scrapear. Fin.")
+    if not sellable:
+        print("Nada nuevo que scrapear. Fin.", flush=True)
         return
 
-    accela_data = scrape_accela_for_permits(to_scrape)
+    # 4. Scrapear + guardar incremental
+    saved, failed = scrape_and_save(sellable)
 
-    print(f"\n[Save] Procesando {len(accela_data)} resultados...")
-    saved, failed = 0, 0
-    for permit_no, accela in accela_data.items():
-        if accela.get("error"):
-            failed += 1
-            continue
-        row = build_row(permit_no, file_date_by_permit.get(permit_no), accela)
-        if upsert_to_supabase(row):
-            saved += 1
-        else:
-            failed += 1
-
-    print(f"\n{'='*60}")
-    print(f"DONE. Guardados: {saved}  Errores: {failed}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*60}", flush=True)
+    print(f"DONE. Guardados: {saved}  Errores: {failed}", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
 
 if __name__ == "__main__":
