@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Hubidx Permit Radar Scraper — Fort Worth
-Versión corregida: TODOS los permisos pasan por Accela para obtener detalles.
+TODOS los permisos pasan por Accela para obtener detalles completos.
 
 Variables de entorno requeridas:
   SUPABASE_URL                  — URL de tu proyecto Supabase
@@ -57,7 +57,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ============================================
-# 1. ARCGIS — solo lista los números de permiso (como el original)
+# 1. ARCGIS
 # ============================================
 def fetch_permit_numbers(days):
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -84,7 +84,6 @@ def fetch_permit_numbers(days):
         if not feats or not data.get("exceededTransferLimit"):
             break
         offset += len(feats)
-    # Dedup
     seen = {}
     for p in results:
         seen[p["permit_number"]] = p
@@ -93,7 +92,7 @@ def fetch_permit_numbers(days):
 
 
 # ============================================
-# 2. ACCELA — scrapea TODO (igual que tu original)
+# 2. ACCELA
 # ============================================
 def parse_contact_block(raw):
     result = {"raw": " | ".join([l.strip() for l in raw.strip().split("\n") if l.strip()])}
@@ -118,7 +117,6 @@ def parse_contact_block(raw):
 
 
 def extract_detail_from_page(page):
-    """Mismo extractor que tu accela_scraper.py original."""
     text = page.inner_text("body")
     info = {}
 
@@ -128,17 +126,14 @@ def extract_detail_from_page(page):
         info["record_type"] = m.group(2).strip()
         info["record_status"] = m.group(3).strip()
 
-    # Dirección — clave!
     m = re.search(r"Permit Address\s*\n\s*(.+?)(?:\n|$)", text)
     if m:
         info["address"] = m.group(1).strip().rstrip(" *,")
 
-    # Descripción del trabajo
     m = re.search(r"Description:\s*\n\s*(.+?)(?:\n\s*\n|\nMore Details|$)", text, re.S)
     if m:
         info["work_description"] = m.group(1).strip()
 
-    # Applicant
     m = re.search(
         r"Applicant:\s*\n(.*?)(?=Licensed Professional:|Owner:|More Details|$)",
         text, re.S,
@@ -146,7 +141,6 @@ def extract_detail_from_page(page):
     if m:
         info["applicant"] = parse_contact_block(m.group(1))
 
-    # Licensed Professional (contractor)
     m = re.search(
         r"Licensed Professional:\s*\n(.*?)(?=Owner:|Applicant:|More Details|$)",
         text, re.S,
@@ -154,7 +148,6 @@ def extract_detail_from_page(page):
     if m:
         info["contractor"] = parse_contact_block(m.group(1))
 
-    # Owner
     m = re.search(
         r"Owner:\s*\n(.*?)(?=More Details|Applicant:|Licensed Professional:|$)",
         text, re.S,
@@ -166,11 +159,11 @@ def extract_detail_from_page(page):
 
 
 def scrape_accela_for_permits(permit_numbers):
-    """Como tu original: cada permiso pasa por Accela."""
     if not permit_numbers:
         return {}
 
-    print(f"[Accela] Scrapeando {len(permit_numbers)} permisos (toma ~{len(permit_numbers) * 5 // 60} min)...")
+    estimated_min = len(permit_numbers) * 5 // 60
+    print(f"[Accela] Scrapeando {len(permit_numbers)} permisos (toma ~{estimated_min} min)...")
     results = {}
 
     with sync_playwright() as pw:
@@ -219,10 +212,6 @@ def scrape_accela_for_permits(permit_numbers):
             except Exception as e:
                 results[permit_no] = {"error": str(e)[:200]}
                 print(f"  {pct} ERR {permit_no}: {e}")
-
-            # Guardar incremental cada 20 permisos
-            if (idx + 1) % 20 == 0:
-                save_batch_to_supabase(results, idx + 1)
 
             time.sleep(DELAY_BETWEEN_SCRAPES)
 
@@ -319,14 +308,6 @@ def build_row(permit_no, file_date_ms, accela_info):
     }
 
 
-# Cache para evitar geocodificar 2 veces
-_save_batch_cache = {}
-
-def save_batch_to_supabase(accela_results, count_so_far):
-    """Guarda los permisos scrapeados hasta ahora (checkpoint cada 20)."""
-    print(f"  ... checkpoint: guardando lo scrapeado hasta {count_so_far}")
-
-
 def upsert_to_supabase(row):
     try:
         supabase.table("permit_leads").upsert(
@@ -349,7 +330,6 @@ def main():
     print(f"Skip existentes: {SKIP_EXISTING}")
     print(f"{'='*60}\n")
 
-    # 1. Lista de permisos de ArcGIS
     permits = fetch_permit_numbers(DAYS_BACK)
     if not permits:
         print("Sin permisos. Salida.")
@@ -358,30 +338,35 @@ def main():
     permit_numbers = [p["permit_number"] for p in permits]
     file_date_by_permit = {p["permit_number"]: p["file_date_ms"] for p in permits}
 
-    # 2. Filtrar: solo scrapear los que NO tienen address en la DB (o todos si SKIP_EXISTING=false)
     to_scrape = permit_numbers
     if SKIP_EXISTING:
-        existing = supabase.table("permit_leads") \
-            .select("permit_number, address") \
-            .eq("city", CITY_KEY) \
-            .in_("permit_number", permit_numbers) \
-            .execute()
-        already_complete = {
-            r["permit_number"] for r in (existing.data or [])
-            if r.get("address")  # solo si TIENE address — los vacíos se re-scrapean
-        }
+        already_complete = set()
+        CHUNK_SIZE = 100
+        print(f"[Plan] Verificando {len(permit_numbers)} permisos en DB (en chunks de {CHUNK_SIZE})...")
+        for i in range(0, len(permit_numbers), CHUNK_SIZE):
+            chunk = permit_numbers[i:i + CHUNK_SIZE]
+            try:
+                resp = supabase.table("permit_leads") \
+                    .select("permit_number, address") \
+                    .eq("city", CITY_KEY) \
+                    .in_("permit_number", chunk) \
+                    .execute()
+                for r in (resp.data or []):
+                    if r.get("address"):
+                        already_complete.add(r["permit_number"])
+            except Exception as e:
+                print(f"  [DB] Error en chunk {i}-{i+CHUNK_SIZE}: {e}")
+
         to_scrape = [p for p in permit_numbers if p not in already_complete]
         print(f"[Plan] {len(already_complete)} ya completos en DB")
-        print(f"[Plan] {len(to_scrape)} a scrapear (incluye los que están en DB sin address)\n")
+        print(f"[Plan] {len(to_scrape)} a scrapear\n")
 
     if not to_scrape:
         print("Nada nuevo que scrapear. Fin.")
         return
 
-    # 3. Scrapear Accela
     accela_data = scrape_accela_for_permits(to_scrape)
 
-    # 4. Construir filas y guardar
     print(f"\n[Save] Procesando {len(accela_data)} resultados...")
     saved, failed = 0, 0
     for permit_no, accela in accela_data.items():
