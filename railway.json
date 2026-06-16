@@ -3,9 +3,5 @@
   "build": {
     "builder": "DOCKERFILE",
     "dockerfilePath": "Dockerfile"
-  },
-  "deploy": {
-    "startCommand": "python scraper.py",
-    "restartPolicyType": "NEVER"
   }
 }
